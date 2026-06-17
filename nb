@@ -1,0 +1,485 @@
+import os
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import torch
+import threading
+import time
+from queue import Queue
+from typing import Optional
+
+# ==================== 🎛️ 监控流配置中心 ====================
+CAMERA_CONFIGS = {
+    "Cam_231_Counter": {
+        "rtsp": "rtsp://Mikhail:999ookjdf@10.10.19.231/stream2",
+        "width": 1280,
+        "height": 720
+    },
+    "Cam_104_Specialty": {
+        "rtsp": "rtsp://Mikhail:999ookjdf@10.10.19.104/stream2",
+        "width": 1280,
+        "height": 720
+    }
+}
+
+# 🎯 狠活配置：我们要捕获的目标 COCO 类别 ID
+# 0: person, 24: backpack, 26: handbag, 28: suitcase, 39: bottle, 41: cup, 67: cell phone
+TARGET_CLASSES = [0, 24, 26, 28, 39, 41, 67]
+
+CLASS_MAPPING = {
+    0: ("Person", (0, 255, 0)),        # 绿色
+    24: ("Backpack", (255, 165, 0)),   # 橙色
+    26: ("Handbag", (255, 0, 255)),    # 紫色
+    28: ("Suitcase", (0, 165, 255)),   # 琥珀色
+    39: ("Bottle", (0, 255, 255)),     # 黄色
+    41: ("Cup", (0, 128, 255)),        # 浅橙
+    67: ("Phone", (0, 0, 255))         # 红色
+}
+
+# COCO 17 关键点骨架连接
+SKELETON = [
+    (0, 1), (0, 2), (1, 3), (2, 4),
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+    (5, 11), (6, 12), (11, 12),
+    (11, 13), (13, 15), (12, 14), (14, 16),
+]
+# 模型规模选择：n/s/m/l/x（越大越准越慢）
+MODEL_SIZE = "x"
+
+MODEL_PRESETS = {
+    "n": {"seg": "yolo11n-seg.pt", "pose": "yolo11n-pose.pt", "imgsz": 640},
+    "s": {"seg": "yolo11s-seg.pt", "pose": "yolo11s-pose.pt", "imgsz": 768},
+    "m": {"seg": "yolo11m-seg.pt", "pose": "yolo11m-pose.pt", "imgsz": 960},
+    "l": {"seg": "yolo11l-seg.pt", "pose": "yolo11l-pose.pt", "imgsz": 1152},
+    "x": {"seg": "yolo11x-seg.pt", "pose": "yolo11x-pose.pt", "imgsz": 1280},
+}
+
+_active = MODEL_PRESETS.get(MODEL_SIZE, MODEL_PRESETS["x"])
+SEG_MODEL = _active["seg"]
+POSE_MODEL = _active["pose"]
+INFER_IMGSZ = _active["imgsz"]
+# 肤色检测开关与参数
+ENABLE_SKIN_DETECT = True
+SKIN_OVERLAY_ALPHA = 0.22  # 红色肤色区域叠加透明度（0=不叠加）
+SKIN_MIN_RATIO = 0.08      # 肤色像素占人体掩码比例阈值（用于显示/标注）
+# =========================================================
+
+
+def _skin_mask_bgr(roi_bgr: np.ndarray) -> np.ndarray:
+    """
+    返回 roi 内肤色二值掩码（uint8 0/255）。
+    组合 YCrCb + HSV 两种阈值，降低误检。
+    """
+    ycrcb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2YCrCb)
+    # 经典肤色范围（经验阈值，实际可按现场光照微调）
+    lower_ycrcb = np.array([0, 133, 77], dtype=np.uint8)
+    upper_ycrcb = np.array([255, 173, 127], dtype=np.uint8)
+    mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb)
+
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    lower_hsv = np.array([0, 40, 80], dtype=np.uint8)
+    upper_hsv = np.array([25, 255, 255], dtype=np.uint8)
+    mask_hsv = cv2.inRange(hsv, lower_hsv, upper_hsv)
+
+    mask = cv2.bitwise_and(mask_ycrcb, mask_hsv)
+    # 轻量清理噪点
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
+    return mask
+# =========================================================
+
+def draw_skeleton(frame, keypoints_xy, keypoints_conf=None, color=(0, 255, 0), thickness=2, conf_thresh=0.5):
+    """在帧上绘制人体骨架与关键点"""
+    if keypoints_xy is None:
+        return
+    kps = keypoints_xy.cpu().numpy() if hasattr(keypoints_xy, "cpu") else np.asarray(keypoints_xy)
+    confs = None
+    if keypoints_conf is not None:
+        confs = keypoints_conf.cpu().numpy() if hasattr(keypoints_conf, "cpu") else np.asarray(keypoints_conf)
+
+    for p_idx, kp in enumerate(kps):
+        kp_conf = confs[p_idx] if confs is not None else None
+        for i, j in SKELETON:
+            if kp[i][0] <= 0 or kp[i][1] <= 0 or kp[j][0] <= 0 or kp[j][1] <= 0:
+                continue
+            if kp_conf is not None and (kp_conf[i] < conf_thresh or kp_conf[j] < conf_thresh):
+                continue
+            cv2.line(frame, (int(kp[i][0]), int(kp[i][1])), (int(kp[j][0]), int(kp[j][1])),
+                     color, thickness, cv2.LINE_AA)
+        for x, y in kp:
+            if x > 0 and y > 0:
+                cv2.circle(frame, (int(x), int(y)), 3, color, -1, cv2.LINE_AA)
+
+
+def classify_pose_simple(kp_xy: np.ndarray, kp_conf: Optional[np.ndarray] = None, conf_thresh: float = 0.35) -> str:
+    """
+    简易姿态分类：站 / 坐 / 躺 / 未知
+    基于 COCO 17 关键点的相对几何关系（不依赖固定像素阈值）。
+    """
+    def ok(i: int) -> bool:
+        if kp_xy[i][0] <= 0 or kp_xy[i][1] <= 0:
+            return False
+        if kp_conf is not None and kp_conf[i] < conf_thresh:
+            return False
+        return True
+
+    # 关键点索引：0 nose, 5/6 shoulders, 11/12 hips, 15/16 ankles
+    if not (ok(5) and ok(6) and ok(11) and ok(12)):
+        return "Unknown"
+
+    shoulder_y = float((kp_xy[5][1] + kp_xy[6][1]) / 2)
+    hip_y = float((kp_xy[11][1] + kp_xy[12][1]) / 2)
+    torso = hip_y - shoulder_y
+    if torso <= 0:
+        return "Unknown"
+
+    # 躺：躯干高度相对肩宽很小（身体接近水平）
+    shoulder_w = abs(float(kp_xy[5][0] - kp_xy[6][0])) if ok(5) and ok(6) else 0.0
+    if shoulder_w > 0 and torso < shoulder_w * 0.35:
+        return "Lying"
+
+    if ok(15) and ok(16):
+        ankle_y = float((kp_xy[15][1] + kp_xy[16][1]) / 2)
+        leg = ankle_y - hip_y
+        if leg > 0:
+            # 坐：腿部有效长度明显变短（膝/踝抬高或弯曲），导致 torso/leg 比例变大
+            ratio = torso / leg
+            if ratio > 0.9:
+                return "Sitting"
+            return "Standing"
+
+    # 没有踝点时，仅凭躯干高度给一个宽松猜测
+    return "Standing" if torso > 0 else "Unknown"
+
+
+def draw_person_contour(frame, mask_xy, color, thickness=2, fill_alpha=0.22):
+    """用分割掩码多边形绘制人体轮廓（替代方框）"""
+    if mask_xy is None or len(mask_xy) < 3:
+        return None
+    pts = np.asarray(mask_xy, dtype=np.int32).reshape(-1, 1, 2)
+    if fill_alpha > 0:
+        fill_layer = frame.copy()
+        cv2.fillPoly(fill_layer, [pts], color)
+        cv2.addWeighted(fill_layer, fill_alpha, frame, 1 - fill_alpha, 0, frame)
+    cv2.polylines(frame, [pts], True, color, thickness, cv2.LINE_AA)
+    top_y = int(np.min(pts[:, 0, 1]))
+    top_x = int(np.mean(pts[:, 0, 0]))
+    return top_x, top_y
+
+
+def detect_and_draw_skin(frame: np.ndarray, mask_xy, label_pos=None):
+    """
+    基于人体分割多边形，在人体区域做肤色检测。
+    - 返回 (skin_ratio, label_pos)
+    - 可选在原图上半透明叠加红色肤色区域
+    """
+    if mask_xy is None or len(mask_xy) < 3:
+        return 0.0, label_pos
+
+    pts = np.asarray(mask_xy, dtype=np.int32).reshape(-1, 1, 2)
+    x, y, w, h = cv2.boundingRect(pts)
+    if w <= 2 or h <= 2:
+        return 0.0, label_pos
+
+    # 裁剪到图像边界
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(frame.shape[1], x + w)
+    y2 = min(frame.shape[0], y + h)
+    if x2 - x1 <= 2 or y2 - y1 <= 2:
+        return 0.0, label_pos
+
+    roi = frame[y1:y2, x1:x2]
+    # 速度优化：大 ROI 先缩小计算，再映射回去
+    max_w = 360
+    scale = 1.0
+    if roi.shape[1] > max_w:
+        scale = max_w / float(roi.shape[1])
+        roi_small = cv2.resize(roi, (int(roi.shape[1] * scale), int(roi.shape[0] * scale)))
+    else:
+        roi_small = roi
+
+    pts_small = (pts - np.array([[x1, y1]], dtype=np.int32)) * scale
+    pts_small = pts_small.astype(np.int32)
+    person_mask = np.zeros((roi_small.shape[0], roi_small.shape[1]), dtype=np.uint8)
+    cv2.fillPoly(person_mask, [pts_small], 255)
+
+    skin_mask = _skin_mask_bgr(roi_small)
+    skin_in_person = cv2.bitwise_and(skin_mask, person_mask)
+    person_area = int(cv2.countNonZero(person_mask))
+    skin_area = int(cv2.countNonZero(skin_in_person))
+    skin_ratio = (skin_area / person_area) if person_area > 0 else 0.0
+
+    if SKIN_OVERLAY_ALPHA > 0 and skin_area > 0:
+        # 映射回原图 ROI 尺寸
+        skin_up = skin_in_person
+        if scale != 1.0:
+            skin_up = cv2.resize(skin_in_person, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST)
+        overlay = roi.copy()
+        overlay[skin_up > 0] = (0, 0, 255)
+        cv2.addWeighted(overlay, SKIN_OVERLAY_ALPHA, roi, 1 - SKIN_OVERLAY_ALPHA, 0, roi)
+
+    # 如果没给 label_pos，用 ROI 顶部中点
+    if label_pos is None:
+        label_pos = (x1 + (x2 - x1) // 2, y1)
+
+    return skin_ratio, label_pos
+
+
+def build_heatmap_views(frame, accum_heatmap, width):
+    """生成主画面热力叠加层与独立热力图窗口画面"""
+    if not np.any(accum_heatmap):
+        return frame.copy(), np.zeros_like(frame)
+
+    blur_k = max(51, int(51 * width / 1280) | 1)
+    blur_heatmap = cv2.GaussianBlur(accum_heatmap, (blur_k, blur_k), 0)
+    heatmap_fixed = np.clip(blur_heatmap * 4, 0, 255).astype(np.uint8)
+    color_heatmap = cv2.applyColorMap(heatmap_fixed, cv2.COLORMAP_JET)
+    overlay_frame = cv2.addWeighted(frame, 0.65, color_heatmap, 0.35, 0)
+    heatmap_panel = cv2.addWeighted(frame, 0.12, color_heatmap, 0.88, 0)
+    return overlay_frame, heatmap_panel
+
+
+def draw_fps_hud(frame, fps, model_label):
+    """右上角显示实时帧率与当前模型档位"""
+    fps_text = f"FPS: {fps:.1f}"
+    model_text = f"Model: {model_label}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fps_size, _ = cv2.getTextSize(fps_text, font, 0.8, 2)
+    model_size, _ = cv2.getTextSize(model_text, font, 0.55, 1)
+    panel_w = max(fps_size[0], model_size[0]) + 24
+    panel_h = fps_size[1] + model_size[1] + 28
+    x1 = frame.shape[1] - panel_w - 10
+    y1 = 10
+    x2 = frame.shape[1] - 10
+    y2 = y1 + panel_h
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), -1)
+    cv2.putText(frame, fps_text, (x1 + 12, y1 + fps_size[1] + 8), font, 0.8, (0, 255, 0), 2)
+    cv2.putText(frame, model_text, (x1 + 12, y2 - 10), font, 0.55, (200, 200, 200), 1)
+
+class RTSPStreamReader(threading.Thread):
+    def __init__(self, name, rtsp_url, width, height):
+        super().__init__()
+        self.name = name
+        self.rtsp_url = rtsp_url
+        self.width = width
+        self.height = height
+        self.frame_queue = Queue(maxsize=3)
+        self.stopped = False
+        self.cap = None
+
+    def _open_capture(self):
+        cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
+    def run(self):
+        print(f"📡 [线程启动] 正在通过 OpenCV 连接 {self.name} ...")
+        self.cap = self._open_capture()
+
+        while not self.stopped:
+            if not self.cap.isOpened():
+                time.sleep(2)
+                self.cap = self._open_capture()
+                continue
+
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                self.cap.release()
+                time.sleep(2)
+                self.cap = self._open_capture()
+                continue
+
+            if frame.shape[1] != self.width or frame.shape[0] != self.height:
+                frame = cv2.resize(frame, (self.width, self.height))
+
+            if self.frame_queue.full():
+                try:
+                    self.frame_queue.get_nowait()
+                except Queue.Empty:
+                    pass
+            self.frame_queue.put(frame)
+
+        if self.cap is not None:
+            self.cap.release()
+
+    def stop(self):
+        self.stopped = True
+
+def start_advanced_store_analytics():
+    if not torch.cuda.is_available():
+        print("❌ 未检测到可用的 NVIDIA CUDA 环境！")
+        return
+    
+    print(f"🔥 零售视界启动！模型: {MODEL_SIZE} | 分割: {SEG_MODEL} | 姿态: {POSE_MODEL} | imgsz={INFER_IMGSZ}")
+    model = YOLO(SEG_MODEL)
+    pose_model = YOLO(POSE_MODEL)
+    model_label = f"11{MODEL_SIZE}"
+
+    readers = {}
+    heatmaps = {}
+    customer_counts = {}
+    counted_ids = {}
+    fps_state = {}
+
+    for cam_name, config in CAMERA_CONFIGS.items():
+        cv2.namedWindow(f"Store Analytics Platform - {cam_name}", cv2.WINDOW_NORMAL)
+        cv2.namedWindow(f"Heatmap - {cam_name}", cv2.WINDOW_NORMAL)
+        reader = RTSPStreamReader(cam_name, config["rtsp"], config["width"], config["height"])
+        reader.daemon = True
+        reader.start()
+        readers[cam_name] = reader
+        
+        heatmaps[cam_name] = np.zeros((config["height"], config["width"]), dtype=np.float32)
+        customer_counts[cam_name] = 0
+        counted_ids[cam_name] = set()
+        fps_state[cam_name] = {"fps": 0.0}
+
+    with torch.inference_mode():
+        while True:
+            for cam_name, reader in readers.items():
+                if reader.frame_queue.empty():
+                    continue
+
+                t0 = time.perf_counter()
+                frame = reader.frame_queue.get()
+                accum_heatmap = heatmaps[cam_name]
+                frame_w = reader.width
+                
+                # 实时动态特征计数看板
+                current_metrics = {name: 0 for name, _ in CLASS_MAPPING.values()}
+
+                # 分割模型：人体输出掩码轮廓，其余类别仍用检测框
+                results = model.track(
+                    source=frame, persist=True, device=0, verbose=False, imgsz=INFER_IMGSZ,
+                    classes=TARGET_CLASSES, tracker="bytetrack.yaml", conf=0.35, iou=0.4
+                )
+                
+                if results[0].boxes is not None:
+                    boxes = results[0].boxes.xyxy.cpu().numpy()
+                    clss = results[0].boxes.cls.cpu().numpy().astype(int)
+                    track_ids = results[0].boxes.id.cpu().numpy().astype(int) if results[0].boxes.id is not None else [None] * len(clss)
+                    masks_xy = results[0].masks.xy if results[0].masks is not None else None
+                    
+                    for idx, (box, cls_id, track_id) in enumerate(zip(boxes, clss, track_ids)):
+                        if cls_id not in CLASS_MAPPING:
+                            continue
+                        
+                        label, color = CLASS_MAPPING[cls_id]
+                        current_metrics[label] += 1
+                        
+                        x1, y1, x2, y2 = box
+                        id_str = f" ID:{track_id}" if track_id is not None else ""
+
+                        if cls_id == 0:
+                            mask_xy = masks_xy[idx] if masks_xy is not None and idx < len(masks_xy) else None
+                            label_pos = draw_person_contour(frame, mask_xy, color)
+                            if label_pos is None:
+                                label_pos = (int(x1), int(y1))
+                            skin_ratio = 0.0
+                            if ENABLE_SKIN_DETECT:
+                                skin_ratio, label_pos = detect_and_draw_skin(frame, mask_xy, label_pos=label_pos)
+                            cv2.putText(frame, f"{label}{id_str}", (label_pos[0], label_pos[1] - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                            if ENABLE_SKIN_DETECT and skin_ratio >= SKIN_MIN_RATIO:
+                                cv2.putText(
+                                    frame,
+                                    f"Skin:{skin_ratio*100:.0f}%",
+                                    (label_pos[0], label_pos[1] + 14),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.5,
+                                    (0, 0, 255),
+                                    2,
+                                )
+                        else:
+                            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                            cv2.putText(frame, f"{label}{id_str}", (int(x1), int(y1) - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                        # 客流计数逻辑 (仅针对人类客流进行 ID 去重计数)
+                        if cls_id == 0 and track_id not in counted_ids[cam_name] and track_id is not None:
+                            counted_ids[cam_name].add(track_id)
+                            customer_counts[cam_name] += 1
+                        
+                        # 客流热力图能量累加（以人脚底为中心）
+                        if cls_id == 0:
+                            cx, cy = int((x1 + x2) / 2), int(y2)
+                            radius = max(22, int(22 * frame_w / 1280))
+                            cv2.circle(accum_heatmap, (cx, cy), radius=radius, color=0.4, thickness=-1)
+
+                # 人体姿态检测 + 骨架叠加（仅当画面中存在行人时推理）
+                if current_metrics["Person"] > 0:
+                    pose_results = pose_model(
+                        frame, verbose=False, device=0, conf=0.35, imgsz=INFER_IMGSZ
+                    )[0]
+                    if pose_results.keypoints is not None:
+                        # 姿态文字（站/坐/躺）打印在每个人鼻子附近
+                        kps_xy = pose_results.keypoints.xy
+                        kps_conf = pose_results.keypoints.conf
+                        kps_xy_np = kps_xy.cpu().numpy() if hasattr(kps_xy, "cpu") else np.asarray(kps_xy)
+                        kps_conf_np = kps_conf.cpu().numpy() if kps_conf is not None and hasattr(kps_conf, "cpu") else (
+                            np.asarray(kps_conf) if kps_conf is not None else None
+                        )
+                        for pi, kp in enumerate(kps_xy_np):
+                            conf = kps_conf_np[pi] if kps_conf_np is not None else None
+                            status = classify_pose_simple(kp, conf)
+                            nose_x, nose_y = int(kp[0][0]), int(kp[0][1])
+                            if nose_x > 0 and nose_y > 0:
+                                cv2.putText(
+                                    frame,
+                                    status,
+                                    (nose_x, max(20, nose_y - 18)),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.75,
+                                    (255, 255, 255),
+                                    2,
+                                )
+                        draw_skeleton(
+                            frame,
+                            pose_results.keypoints.xy,
+                            pose_results.keypoints.conf,
+                            color=CLASS_MAPPING[0][1],
+                            thickness=3,
+                        )
+
+                # 热力图：主画面叠加 + 独立热力图窗口
+                overlay_frame, heatmap_panel = build_heatmap_views(frame, accum_heatmap, frame_w)
+
+                # 帧率统计（指数滑动平均，更平滑）
+                dt = time.perf_counter() - t0
+                if dt > 0:
+                    instant_fps = 1.0 / dt
+                    state = fps_state[cam_name]
+                    state["fps"] = state["fps"] * 0.85 + instant_fps * 0.15 if state["fps"] > 0 else instant_fps
+
+                # 📊 极速渲染多维度数据透明面板
+                panel_h = 40 + len(current_metrics) * 25
+                cv2.rectangle(overlay_frame, (10, 10), (320, panel_h), (0, 0, 0), -1)
+                
+                # 打印累计客流
+                cv2.putText(overlay_frame, f"Total Customers: {customer_counts[cam_name]}", (20, 35), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
+                # 动态打印当前帧的各种物品/属性统计
+                for idx, (label, count) in enumerate(current_metrics.items()):
+                    y_pos = 65 + idx * 25
+                    _, color = next(v for k, v in CLASS_MAPPING.items() if v[0] == label)
+                    cv2.putText(overlay_frame, f"Current {label}s: {count}", (20, y_pos), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+                draw_fps_hud(overlay_frame, fps_state[cam_name]["fps"], model_label)
+
+                cv2.imshow(f"Store Analytics Platform - {cam_name}", overlay_frame)
+                cv2.imshow(f"Heatmap - {cam_name}", heatmap_panel)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    for reader in readers.values(): reader.stop()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    start_advanced_store_analytics()
